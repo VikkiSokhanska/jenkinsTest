@@ -1,0 +1,196 @@
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+  config.vm.boot_timeout = 600
+
+  DB_IP  = "192.168.0.192"
+  APP_IP = "192.168.0.193"
+
+  def vm_common(vb, name)
+    vb.name   = name
+    vb.gui    = false
+    vb.memory = 4096
+    vb.cpus   = 2
+    vb.customize ["modifyvm", :id, "--graphicscontroller", "vmsvga"]
+    vb.customize ["modifyvm", :id, "--vram", "16"]
+    vb.customize ["modifyvm", :id, "--audiocontroller", "ac97"]
+    vb.customize ["modifyvm", :id, "--usb", "on"]
+    vb.customize ["modifyvm", :id, "--usbehci", "on"]
+  end
+
+  config.ssh.insert_key = true
+
+  config.vm.define "db" do |db|
+    db.vm.hostname = "db"
+    db.vm.network "private_network", ip: DB_IP
+
+    db.vm.provider "virtualbox" do |vb|
+      vm_common(vb, "Ubuntu-DB")
+    end
+
+    db.vm.provision "shell", inline: <<-SHELL
+      set -e
+
+      echo "[1/6] Install & start Postgres"
+      apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql postgresql-contrib ufw
+      systemctl enable --now postgresql
+
+      echo "[2/6] Paths"
+      CONF_FILE=$(sudo -u postgres psql -tAc "SHOW config_file;")
+      HBA_FILE=$(sudo -u postgres psql -tAc "SHOW hba_file;")
+      echo "conf: $CONF_FILE  hba: $HBA_FILE"
+
+      echo "[2a/6] Bind to #{DB_IP}"
+      if grep -Eq '^[#\\s]*listen_addresses\\s*=' "$CONF_FILE"; then
+        sed -ri "s/^[#\\s]*listen_addresses\\s*=.*/listen_addresses = '#{DB_IP}'/" "$CONF_FILE"
+      else
+        echo "listen_addresses = '#{DB_IP}'" >> "$CONF_FILE"
+      fi
+
+      echo "[3/6] pg_hba rules"
+      LINE_APP="host    forum    forumuser    #{APP_IP}/32    scram-sha-256"
+      LINE_DB="host    forum    forumuser    #{DB_IP}/32    scram-sha-256"
+      grep -Fq "$LINE_APP" "$HBA_FILE" || echo "$LINE_APP" >> "$HBA_FILE"
+      grep -Fq "$LINE_DB"  "$HBA_FILE" || echo "$LINE_DB"  >> "$HBA_FILE"
+      systemctl restart postgresql
+
+      echo "[4/6] Create DB/user"
+
+      # Create user forumuser if it doesn't exist
+      sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='forumuser'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE ROLE forumuser WITH LOGIN PASSWORD 'password';"
+
+      # Create database forum with owner forumuser (if not exists)
+      sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='forum'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE DATABASE forum OWNER forumuser;"
+
+      # Make sure owner/schema/privileges are correct
+      sudo -u postgres psql -d forum -c "ALTER DATABASE forum OWNER TO forumuser;"
+      sudo -u postgres psql -d forum -c "ALTER SCHEMA public OWNER TO forumuser;"
+      sudo -u postgres psql -d forum -c "GRANT USAGE, CREATE ON SCHEMA public TO forumuser;"
+
+      echo "[5/6] UFW"
+      ufw allow OpenSSH
+      ufw allow from #{APP_IP} to any port 5432 proto tcp
+      ufw --force enable
+      ufw status verbose
+
+      sudo -u postgres psql -v ON_ERROR_STOP=1 -d forum \
+        -c "ALTER SCHEMA public OWNER TO forumuser;" \
+        -c "GRANT USAGE, CREATE ON SCHEMA public TO forumuser;" \
+        -c "GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO forumuser;" \
+        -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO forumuser;" \
+        -c "GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO forumuser;" \
+        -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES    TO forumuser;" \
+        -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO forumuser;" \
+        -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO forumuser;"
+
+      echo "[6/6] Import dump if present"
+      DUMP="/vagrant/forum_d.sql"
+      if [ -f "$DUMP" ]; then
+        if ! sudo -u postgres psql -d forum -tAc \
+            "SELECT 1 FROM information_schema.tables WHERE table_schema='public' LIMIT 1" | grep -q 1; then
+            export PGPASSWORD=password
+            sudo -u postgres psql -v ON_ERROR_STOP=1 -d forum -f "$DUMP"
+        else
+            echo "Skip import: database 'forum' is not empty"
+        fi
+      fi
+      echo "DB done."
+    SHELL
+  end
+
+  config.vm.define "app" do |app|
+    app.vm.hostname = "app"
+    app.vm.network "private_network", ip: APP_IP
+
+    app.vm.provider "virtualbox" do |vb|
+      vm_common(vb, "Ubuntu-APP")
+    end
+
+    app.vm.provision "file",
+      source: "~/.ssh/id_ed25519",
+      destination: "/home/vagrant/.ssh/id_rsa"
+
+    REPO_URL   = "git@github.com:Oleksandr-Naumchak/pyforum-DevOps-UA-1360.git"
+    PROJECTDIR = "/home/vagrant/pyforum"
+
+    app.vm.provision "shell", inline: <<-SHELL
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+
+      echo "[1/3] System deps, clone, venv"
+      apt-get update -y
+      apt-get install -y git python3 python3-venv python3-pip build-essential libpq-dev python3-dev
+
+      sudo -u vagrant mkdir -p /home/vagrant/.ssh
+      chmod 700 /home/vagrant/.ssh
+      chmod 600 /home/vagrant/.ssh/id_rsa
+      chown -R vagrant:vagrant /home/vagrant/.ssh
+
+      sudo -u vagrant ssh-keyscan -H github.com >> /home/vagrant/.ssh/known_hosts
+
+      # clone if not exists
+      if [ ! -d "#{PROJECTDIR}/.git" ]; then
+        sudo -u vagrant git clone #{REPO_URL} #{PROJECTDIR}
+      fi
+      cd #{PROJECTDIR}
+
+      # Python venv
+      sudo -u vagrant /usr/bin/python3 -m venv .venv
+      source .venv/bin/activate
+      pip install -U pip wheel
+      if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      echo "[2/3] .env -> DB_HOST=#{DB_IP}"
+      cat > #{PROJECTDIR}/.env <<'EOF'
+# --- Django ---
+SECRET_KEY=secret_key
+
+# --- Postgres (remote) ---
+PG_DB=forum
+PG_USER=forumuser
+PG_PASSWORD=password
+DB_HOST=#{DB_IP}
+DB_PORT=5432
+
+# Optional (email/CORS)
+EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend
+EMAIL_HOST=someuser@gmail.com
+EMAIL_PORT=587
+EMAIL_USE_TLS=1
+EMAIL_HOST_USER=test@test.com
+EMAIL_HOST_PASSWORD=test-password
+CORS_ORIGIN_WHITELIST=
+EOF
+      chown vagrant:vagrant #{PROJECTDIR}/.env
+
+      echo "[2a/3] logs/"
+      mkdir -p #{PROJECTDIR}/logs
+      touch #{PROJECTDIR}/logs/django.log
+      chown -R vagrant:vagrant #{PROJECTDIR}/logs
+
+      echo "[3/3] systemd service for Django (runserver 0.0.0.0:8000)"
+      cat > /etc/systemd/system/django-app.service <<'UNIT'
+[Unit]
+Description=Django dev server
+After=network-online.target
+
+[Service]
+User=vagrant
+WorkingDirectory=#{PROJECTDIR}
+EnvironmentFile=#{PROJECTDIR}/.env
+ExecStart=#{PROJECTDIR}/.venv/bin/python manage.py runserver 0.0.0.0:8000
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+      systemctl daemon-reload
+      systemctl enable --now django-app.service
+
+      echo "APP ready. Django is running on 192.168.0.193:8000 inside VM."
+    SHELL
+  end
+end
