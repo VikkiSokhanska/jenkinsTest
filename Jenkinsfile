@@ -6,15 +6,9 @@ pipeline {
     }
 
     stages {
-        stage('Clone repository') {
-            steps {
-                git branch: 'main', url: 'https://github.com/VikkiSokhanska/jenkinsTest.git'
-            }
-        }
-
         stage('Create .env') {
             steps {
-                sh 'cp "$ENV_FILE" .env'
+                sh 'echo "$ENV_FILE" > .env'
             }
         }
 
