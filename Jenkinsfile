@@ -6,18 +6,30 @@ pipeline {
     }
 
     stages {
+        stage('Clone repository') {
+            steps {
+                dir('repo') { // створюємо окрему папку
+                    git branch: 'main', url: 'https://github.com/VikkiSokhanska/jenkinsTest.git'
+                }
+            }
+        }
+
         stage('Create .env') {
             steps {
-                sh 'echo "$ENV_FILE" > .env'
+                dir('repo') {
+                    sh 'echo "$ENV_FILE" > .env'
+                }
             }
         }
 
         stage('Build and Run containers') {
             steps {
-                sh '''
-                docker compose down || true
-                docker compose up -d --build
-                '''
+                dir('repo') {
+                    sh '''
+                    docker compose down || true
+                    docker compose up -d --build
+                    '''
+                }
             }
         }
     }
