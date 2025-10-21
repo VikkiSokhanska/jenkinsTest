@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     environment {
-        ENV_FILE = credentials('forum_env') // зберігаєш .env у Jenkins credentials
+        ENV_FILE = credentials('forum_env')
     }
 
     stages {
@@ -14,7 +14,7 @@ pipeline {
 
         stage('Create .env') {
             steps {
-                sh 'echo "$ENV_FILE" > .env'
+                sh 'cp "$ENV_FILE" .env'
             }
         }
 
