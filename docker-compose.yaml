@@ -1,20 +1,45 @@
-version: '3.8'
+version: "3.9"
 
 services:
-  jenkins:
-    image: jenkins/jenkins:lts
-    container_name: jenkins
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-      - "50000:50000"
+  db:
+    image: postgres:15-alpine
+    environment:
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}    # good — lets the image create the "forum" DB
     volumes:
-      # Jenkins data
-      - jenkins_home:/var/jenkins_home
-      # Docker socket (дозволяє керувати контейнерами хоста)
-      - /var/run/docker.sock:/var/run/docker.sock
-      # Docker CLI (щоб Jenkins міг викликати docker)
-      - /usr/bin/docker:/usr/bin/docker
+      - db-data:/var/lib/postgresql/data
+      #- ./docker/01-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./docker/01-init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+      # keep only the .sh in initdb.d:
+      - ./docker/02-seed.sh:/docker-entrypoint-initdb.d/02-seed.sh:ro
+      # mount the dump OUTSIDE initdb.d so it won't auto-run:
+      - ./forum_d.sql:/seed/forum_d.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d forum || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  web:
+    user: "${HOST_UID}:${HOST_GID}"
+    build: .
+    container_name: project_web
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - ./.env
+    ports:
+      - "8000:8000"
+    # --- DEV: auto-reload with your local code ---
+    volumes:
+      - .:/app
+    # --- PROD-ish: switch to gunicorn (see comment in Dockerfile) ---
+    # command: ["gunicorn", "-b", "0.0.0.0:8000", "forum-sandbox.wsgi:application"]
+    # If that import errors due to the hyphen, change to: forum_sandbox.wsgi:application
 
 volumes:
-  jenkins_home:
+  db-data:
