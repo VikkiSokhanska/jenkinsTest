@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env bashls
 set -e
 
 # --- Ensure logs path exists even when the project dir is bind-mounted
